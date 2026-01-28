@@ -215,3 +215,8 @@ app.get('/', (req, res) => res.send('Gemini RAG Bot Running'));
 // ---------- START SERVER ----------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server ON ${PORT}`));
+
+app.get('/dbtest', async (req, res) => {
+  const r = await pool.query('select * from inventory limit 5');
+  res.json(r.rows);
+});
