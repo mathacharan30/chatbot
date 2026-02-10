@@ -1,222 +1,208 @@
-// server.js - Gemini RAG Bot
+// server.js — Gemini RAG with Supabase + Hugging Face embeddings
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { createClient } = require('@supabase/supabase-js');
+const { HfInference } = require('@huggingface/inference');
+
 
 const app = express();
 
-// ---------- MIDDLEWARE ----------
+/* -------------------- MIDDLEWARE -------------------- */
 app.use(
   cors({
-    origin: [
-      'http://localhost:5173', // Vite dev (change/extend if needed)
-      'http://localhost:3000',
-      // 'https://your-frontend-domain.com', // add your prod domain later
-    ],
+    origin: ['http://localhost:5173', 'http://localhost:3000'],
     credentials: true,
   })
 );
 app.use(express.json());
 
-// ---------- GEMINI SETUP ----------
+/* -------------------- GEMINI (CHAT) -------------------- */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// use a stable, available model alias
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
-// ---------- POSTGRES / SUPABASE SETUP ----------
-/*
-  In your .env:
-
-  DATABASE_URL=postgres://postgres:YOUR_PASSWORD@db.xxxxxx.supabase.co:5432/postgres
-*/
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false, // required for Supabase
-  },
+const chatModel = genAI.getGenerativeModel({
+  model: 'gemini-2.5-flash',
 });
 
-// ---------- DB SCHEMA DESCRIPTION (for Gemini prompt) ----------
-const DB_SCHEMA = `
-You are connected to a PostgreSQL database for supply chain analytics.
+/* -------------------- HUGGING FACE (EMBEDDINGS) -------------------- */
+const HF_EMBEDDING_MODEL =
+  process.env.HF_EMBEDDING_MODEL ||
+  'sentence-transformers/all-MiniLM-L6-v2';
+const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
 
-Tables and columns:
 
-1) inventory
-   - id (serial, primary key)
-   - sku (text)
-   - product_name (text)
-   - location (text)
-   - quantity (integer)
-   - safety_stock (integer)
-   - updated_at (timestamp)
+/* -------------------- SUPABASE -------------------- */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
 
-2) orders
-   - id (serial, primary key)
-   - order_date (date)
-   - customer_name (text)
-   - status (text) -- 'pending', 'shipped', 'delayed'
-   - total_amount (numeric)
+/* -------------------- HELPERS -------------------- */
 
-3) shipments
-   - id (serial, primary key)
-   - shipment_date (date)
-   - origin (text)
-   - destination (text)
-   - status (text) -- 'on-time', 'delayed'
-   - carrier (text)
-   - tracking_number (text)
+// Embed text using Hugging Face
+async function embedText(text) {
+  const embedding = await hf.featureExtraction({
+    model: 'sentence-transformers/all-MiniLM-L6-v2',
+    inputs: text,
+  });
 
-4) suppliers
-   - id (serial, primary key)
-   - supplier_name (text)
-   - lead_time_days (integer)
-   - on_time_rate (numeric) -- 0-1 fraction
-
-Use ONLY these tables and columns when writing SQL.
-`;
-
-// ---------- SQL PLANNER (Gemini) ----------
-async function generateSQL(userQuery) {
-  const prompt = `
-You are a SQL planner for a supply chain PostgreSQL database.
-
-Database Schema:
-${DB_SCHEMA}
-
-User Request: "${userQuery}"
-
-Your job:
-1. Decide if we need to run a SQL query.
-   - If the user asks for actual data, numbers, counts, lists, dates, etc. -> "use_sql": true
-   - If the user asks for general theory or definitions (e.g. "What is safety stock?") -> "use_sql": false
-
-2. If "use_sql" = true:
-   - Write ONE valid PostgreSQL SELECT query.
-   - Use ONLY the tables/columns from the schema.
-   - Never use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, etc.
-   - Use a LIMIT when returning many rows (e.g. LIMIT 100).
-
-3. Respond with ONLY raw JSON. No markdown, no backticks, no explanation.
-
-Format (very important):
-{
-  "use_sql": true or false,
-  "sql": "SELECT ...",   // a string, or null if use_sql is false
-  "reason": "short explanation"
-}
-`;
-
-  const result = await model.generateContent(prompt);
-  let content = result.response.text().trim();
-
-  console.log('Raw Gemini plan:', content);
-
-  // Strip ```json ... ``` if Gemini decides to be cute
-  if (content.startsWith('```')) {
-    content = content.replace(/```json/gi, '').replace(/```/g, '').trim();
+  if (!Array.isArray(embedding)) {
+    throw new Error('Invalid embedding returned from Hugging Face');
   }
 
-  // Extract first {...} block
-  const match = content.match(/\{[\s\S]*\}/);
-  if (!match) {
-    console.error('No JSON object found in Gemini response');
-    return { use_sql: false, sql: null, reason: 'No JSON object in model response' };
-  }
-
-  try {
-    return JSON.parse(match[0]);
-  } catch (e) {
-    console.error('Failed to parse JSON from Gemini:', e.message);
-    return { use_sql: false, sql: null, reason: 'JSON Parse Error: ' + e.message };
-  }
+  return embedding; // length = 384
 }
 
-// ---------- FINAL ANSWER GENERATION (Gemini) ----------
-async function generateFinalAnswer(userQuery, dbData, plan) {
-  const prompt = `
-You are a Supply Chain AI Assistant.
 
-User question:
-${userQuery}
 
-SQL plan (for context):
-${JSON.stringify(plan, null, 2)}
+// Insert / update document
+async function upsertDocument({ id, title, text, metadata }) {
+  const embedding = await embedText(text);
 
-Database result rows (if any):
-${JSON.stringify(dbData, null, 2)}
+  const { data, error } = await supabase
+    .from('documents')
+    .upsert(
+      {
+        id,
+        title: title || null,
+        content: text,
+        metadata: metadata || {},
+        embedding,
+      },
+      { onConflict: 'id' }
+    )
+    .select('*');
 
-Instructions:
-- If "use_sql" is true and rows exist, use them as ground truth.
-- Explain clearly and simply, like you're talking to a supply chain analyst.
-- Mention important numbers, trends, or counts.
-- If no rows were returned, honestly say there is no data for that query.
-- If "use_sql" is false, answer from general supply chain knowledge (no fake numbers).
+  if (error) throw error;
+  return data;
+}
+
+// Vector similarity search
+async function searchSimilar(
+  embedding,
+  matchCount = 6,
+  similarityThreshold = 0.6
+) {
+  const { data, error } = await supabase.rpc('match_documents', {
+    query_embedding: embedding,
+    match_count: matchCount,
+    similarity_threshold: similarityThreshold,
+  });
+
+  if (error) throw error;
+  return data || [];
+}
+
+// Generate answer using Gemini + retrieved context
+async function generateRagAnswer(question, contexts) {
+  const contextBlock =
+    contexts.length === 0
+      ? 'No relevant context found.'
+      : contexts
+        .map(
+          (c, i) =>
+            `Chunk ${i + 1} (score ${c.similarity.toFixed(3)}):\n${c.content}`
+        )
+        .join('\n\n');
+
+ const prompt = `
+You are a helpful assistant.
+
+Answer the question using the provided context.
+You may rephrase and combine information from the context.
+
+If the context is related but incomplete, give the best possible answer
+based strictly on the context.
+
+If the context is completely unrelated, say "I do not know".
+
+Context:
+${contextBlock}
+
+Question: ${question}
+
+Answer:
 `;
 
-  const result = await model.generateContent(prompt);
+
+  const result = await chatModel.generateContent(prompt);
   return result.response.text();
 }
 
-// ---------- /chat ROUTE ----------
+/* -------------------- ROUTES -------------------- */
+
+// Health check
+app.get('/', (_req, res) => {
+  res.send('Gemini + HuggingFace + Supabase RAG running');
+});
+
+// Ingest document
+app.post('/ingest', async (req, res) => {
+  const { id, title, text, metadata } = req.body;
+
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: 'text is required' });
+  }
+
+  try {
+    const data = await upsertDocument({ id, title, text, metadata });
+    res.json({ inserted: data });
+  } catch (err) {
+    console.error('Ingest error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Chat with RAG
 app.post('/chat', async (req, res) => {
-  const { message } = req.body;
+  const { message, matchCount, similarityThreshold } = req.body;
 
   if (!message || !message.trim()) {
     return res.status(400).json({ error: 'message is required' });
   }
 
   try {
-    // 1) Plan SQL
-    const plan = await generateSQL(message);
-    console.log('SQL Plan:', plan);
+    const queryEmbedding = await embedText(message);
+    const contexts = await searchSimilar(
+      queryEmbedding,
+      Number(matchCount) || 6,
+      similarityThreshold ?? 0.6
+    );
 
-    let rows = [];
+    const answer = await generateRagAnswer(message, contexts);
 
-    // 2) Run SQL if requested
-    if (plan.use_sql && plan.sql) {
-      try {
-        console.log('Executing SQL:', plan.sql);
-        const result = await pool.query(plan.sql);
-        rows = result.rows;
-      } catch (err) {
-        console.error('SQL error:', err);
-        return res.status(400).json({
-          error: 'SQL Failed',
-          detail: err.message,
-          sql: plan.sql,
-        });
-      }
-    }
-
-    // 3) Generate final natural language answer
-    const finalAnswer = await generateFinalAnswer(message, rows, plan);
-
-    return res.json({
-      summary: finalAnswer, // your frontend uses this
-      sql: plan.sql || null,
-      rows,                 // nice for debugging
-      plan,                 // optional: can inspect in dev tools
+    res.json({
+      answer,
+      contexts,
     });
   } catch (err) {
-    console.error('Server/Gemini error:', err);
-    return res.status(500).json({
-      error: 'Internal Error',
-      details: err.message,
+    console.error('Chat error:', err);
+    res.status(500).json({ error: 'RAG failed', detail: err.message });
+  }
+});
+
+// Config / debug
+app.get('/models', async (_req, res) => {
+  try {
+    const testEmbedding = await embedText('Hello test');
+    res.json({
+      chat_model: 'gemini-2.5-flash',
+      embedding_model: HF_EMBEDDING_MODEL,
+      embedding_dimensions: testEmbedding.length,
+      embedding_test: 'success',
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: 'Embedding test failed',
+      detail: err.message,
     });
   }
 });
 
-// ---------- HEALTH CHECK ----------
-app.get('/', (req, res) => res.send('Gemini RAG Bot Running'));
-
-// ---------- START SERVER ----------
+/* -------------------- START SERVER -------------------- */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Server ON ${PORT}`));
-
-app.get('/dbtest', async (req, res) => {
-  const r = await pool.query('select * from inventory limit 5');
-  res.json(r.rows);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on http://localhost:${PORT}`)
+);
