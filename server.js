@@ -13,7 +13,7 @@ const app = express();
 /* -------------------- MIDDLEWARE -------------------- */
 app.use(
   cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000'],
+    origin: ['http://localhost:5174', 'http://localhost:3000'],
     credentials: true,
   })
 );
@@ -95,6 +95,83 @@ async function searchSimilar(
   return data || [];
 }
 
+// Fallback keyword search when vector similarity yields no useful hits
+async function searchByKeyword(question, limit = 6) {
+  const stopWords = new Set([
+    'what', 'which', 'where', 'when', 'why', 'how', 'show', 'find', 'with',
+    'from', 'into', 'that', 'this', 'there', 'their', 'about', 'have', 'has',
+    'had', 'will', 'would', 'could', 'should', 'please', 'list', 'records',
+    'record', 'data', 'give', 'some', 'any', 'all', 'for', 'and', 'the', 'are'
+  ]);
+
+  const terms = (question.toLowerCase().match(/[a-z0-9_]+/g) || [])
+    .filter((w) => w.length >= 4 && !stopWords.has(w));
+
+  const uniqueTerms = [...new Set(terms)].slice(0, 6);
+  if (uniqueTerms.length === 0) {
+    return [];
+  }
+
+  const orClause = uniqueTerms
+    .map((term) => `content.ilike.%${term}%`)
+    .join(',');
+
+  const { data, error } = await supabase
+    .from('documents')
+    .select('id, title, content, metadata')
+    .or(orClause)
+    .limit(limit);
+
+  if (error) throw error;
+
+  let contexts = (data || []).map((row) => ({
+    ...row,
+    similarity: 0.51
+  }));
+
+  const utilAboveMatch = question.toLowerCase().match(/utilization\s*(above|over|greater than)\s*(\d{1,3})/);
+  if (utilAboveMatch) {
+    const threshold = Number(utilAboveMatch[2]);
+    contexts = contexts.filter(
+      (c) =>
+        c?.metadata?.record_type === 'vehicle' &&
+        Number(c?.metadata?.utilization_percent) > threshold
+    );
+  }
+
+  return contexts.slice(0, limit);
+}
+
+async function searchVehiclesByUtilizationThreshold(question, limit = 6) {
+  const match = question
+    .toLowerCase()
+    .match(/utilization\s*(above|over|greater than)\s*(\d{1,3})/);
+
+  if (!match) return null;
+
+  const threshold = Number(match[2]);
+
+  const { data, error } = await supabase
+    .from('documents')
+    .select('id, title, content, metadata')
+    .eq('metadata->>record_type', 'vehicle')
+    .limit(500);
+
+  if (error) throw error;
+
+  const filtered = (data || [])
+    .filter((row) => Number(row?.metadata?.utilization_percent) > threshold)
+    .sort(
+      (a, b) =>
+        Number(b?.metadata?.utilization_percent || 0) -
+        Number(a?.metadata?.utilization_percent || 0)
+    )
+    .slice(0, limit)
+    .map((row) => ({ ...row, similarity: 0.9 }));
+
+  return filtered;
+}
+
 // Generate answer using Gemini + retrieved context
 async function generateRagAnswer(question, contexts) {
   const contextBlock =
@@ -116,7 +193,10 @@ You may rephrase and combine information from the context.
 If the context is related but incomplete, give the best possible answer
 based strictly on the context.
 
-If the context is completely unrelated, say "I do not know".
+If the context is empty, say "I do not know".
+If the context does not contain an exact match for a filter condition,
+clearly say "No exact match found in retrieved records" and then provide
+the closest relevant records from context.
 
 Context:
 ${contextBlock}
@@ -164,12 +244,24 @@ app.post('/chat', async (req, res) => {
   }
 
   try {
-    const queryEmbedding = await embedText(message);
-    const contexts = await searchSimilar(
-      queryEmbedding,
-      Number(matchCount) || 6,
-      similarityThreshold ?? 0.6
-    );
+    let contexts =
+      (await searchVehiclesByUtilizationThreshold(
+        message,
+        Number(matchCount) || 6
+      )) || [];
+
+    if (contexts.length === 0) {
+      const queryEmbedding = await embedText(message);
+      contexts = await searchSimilar(
+        queryEmbedding,
+        Number(matchCount) || 6,
+        similarityThreshold ?? 0.6
+      );
+    }
+
+    if (!contexts || contexts.length === 0) {
+      contexts = await searchByKeyword(message, Number(matchCount) || 6);
+    }
 
     const answer = await generateRagAnswer(message, contexts);
 
