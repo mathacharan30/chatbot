@@ -13,7 +13,7 @@ const app = express();
 /* -------------------- MIDDLEWARE -------------------- */
 app.use(
   cors({
-    origin: ['http://localhost:5174', 'http://localhost:3000'],
+    origin: ['http://localhost:5174', 'http://localhost:3000','https://supply-chain-chatbot-frontend-1.onrender.com'],
     credentials: true,
   })
 );
